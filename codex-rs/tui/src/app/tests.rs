@@ -4075,6 +4075,7 @@ async fn make_test_app() -> App {
         app_server_target: crate::AppServerTarget::Embedded,
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
+        consecutive_loop_errors: 0,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
@@ -4140,6 +4141,7 @@ async fn make_test_app_with_channels() -> (
             app_server_target: crate::AppServerTarget::Embedded,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
+            consecutive_loop_errors: 0,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
@@ -6210,4 +6212,58 @@ async fn side_backtrack_rejection_reports_unavailable_message_snapshot() {
 }
 async fn start_config_write_test_app_server(app: &App) -> Result<AppServerSession> {
     Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await
+}
+
+#[tokio::test]
+async fn recoverable_loop_error_should_not_kill_session() {
+    // A transient, non-terminal error (e.g. a transcript reflow glitch during the heavy redraw
+    // that an interrupt triggers while a long-running task streams output) must NOT tear the
+    // whole TUI down. Regression test for the "tui error" crash on Esc/Ctrl-C during a task.
+    let mut app = make_test_app().await;
+    let err = color_eyre::eyre::eyre!("transcript reflow glitch");
+    let control = app.resolve_loop_error(err);
+    assert_matches!(control, AppRunControl::Continue);
+    assert_eq!(app.consecutive_loop_errors, 1);
+}
+
+#[tokio::test]
+async fn fatal_terminal_error_exits_gracefully() {
+    // A genuinely dead terminal (broken pipe on stdout) should exit, but via the graceful Fatal
+    // path so the embedded app-server shutdown still flushes the rollout — never an unhandled
+    // error that unwinds past the flush.
+    let mut app = make_test_app().await;
+    let err = color_eyre::eyre::Report::new(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "stdout closed",
+    ));
+    let control = app.resolve_loop_error(err);
+    assert_matches!(control, AppRunControl::Exit(ExitReason::Fatal(_)));
+}
+
+#[tokio::test]
+async fn repeated_recoverable_errors_eventually_exit() {
+    // A render that fails on every frame must not spin forever; after a bounded number of
+    // consecutive recoverable errors the loop exits gracefully.
+    let mut app = make_test_app().await;
+    let mut last = AppRunControl::Continue;
+    for _ in 0..MAX_CONSECUTIVE_LOOP_ERRORS {
+        last = app.resolve_loop_error(color_eyre::eyre::eyre!("glitch"));
+    }
+    assert_matches!(last, AppRunControl::Exit(ExitReason::Fatal(_)));
+}
+
+#[tokio::test]
+async fn loop_panic_exits_gracefully() {
+    // A panic while handling an event must be turned into a graceful Fatal exit (so the post-loop
+    // app-server shutdown flushes the rollout) rather than unwinding past the flush and losing the
+    // in-flight turn on resume.
+    let mut app = make_test_app().await;
+    let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+    let control = app.resolve_loop_panic(payload);
+    match control {
+        AppRunControl::Exit(ExitReason::Fatal(message)) => {
+            assert!(message.contains("boom"), "message was {message:?}");
+        }
+        other => panic!("expected graceful fatal exit, got {other:?}"),
+    }
 }

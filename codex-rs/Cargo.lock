@@ -4064,6 +4064,7 @@ dependencies = [
  "diffy",
  "dirs",
  "dunce",
+ "futures",
  "image",
  "insta",
  "itertools 0.14.0",

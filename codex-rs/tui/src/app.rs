@@ -170,6 +170,7 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use futures::future::FutureExt;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
@@ -180,6 +181,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io::Write;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -429,6 +431,46 @@ pub enum ExitReason {
     Fatal(String),
 }
 
+/// Upper bound on consecutive recoverable main-loop errors before we give up and exit gracefully.
+/// Prevents a permanently failing render from spinning the loop forever.
+const MAX_CONSECUTIVE_LOOP_ERRORS: u32 = 8;
+
+/// Whether an error surfaced by a main-loop iteration can be recovered from (keep the session
+/// alive) or means the terminal is unusable (exit gracefully so the rollout still flushes).
+enum LoopErrorDisposition {
+    Recoverable,
+    Fatal,
+}
+
+/// Classify a main-loop error. Anything backed by an I/O error indicating the terminal/stdout is
+/// gone is fatal; everything else (e.g. a transient transcript reflow glitch) is recoverable so a
+/// single bad frame never tears the whole session down.
+fn classify_loop_error(err: &color_eyre::eyre::Report) -> LoopErrorDisposition {
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::{BrokenPipe, ConnectionReset, NotConnected, UnexpectedEof};
+            if matches!(
+                io.kind(),
+                BrokenPipe | NotConnected | ConnectionReset | UnexpectedEof
+            ) {
+                return LoopErrorDisposition::Fatal;
+            }
+        }
+    }
+    LoopErrorDisposition::Recoverable
+}
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_payload_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 fn session_summary(
     token_usage: TokenUsage,
     thread_id: Option<ThreadId>,
@@ -563,6 +605,11 @@ pub(crate) struct App {
     /// This is thread-scoped state (`Option<ThreadId>`) instead of a global bool
     /// so shutdown events from other threads still take the normal failover path.
     pending_shutdown_exit_thread_id: Option<ThreadId>,
+
+    /// Number of consecutive main-loop iterations that ended in a recoverable error. Reset to
+    /// zero on the first clean iteration. Used to bound recovery so a permanently failing render
+    /// cannot spin forever.
+    consecutive_loop_errors: u32,
 
     windows_sandbox: WindowsSandboxState,
 
@@ -1039,6 +1086,7 @@ See the Codex keymap documentation for supported actions and examples."
             app_server_target,
             pending_update_action: None,
             pending_shutdown_exit_thread_id: None,
+            consecutive_loop_errors: 0,
             windows_sandbox: WindowsSandboxState::default(),
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
@@ -1145,15 +1193,16 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(debug_assertions)]
         let pre_loop_exit_reason: Option<ExitReason> = None;
 
-        let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
-            Ok(exit_reason)
+        let exit_reason = if let Some(exit_reason) = pre_loop_exit_reason {
+            exit_reason
         } else {
             loop {
                 let control = select! {
                     Some(event) = app_event_rx.recv() => {
-                        match Box::pin(app.handle_event(tui, &mut app_server, event)).await {
-                            Ok(control) => control,
-                            Err(err) => break Err(err),
+                        match AssertUnwindSafe(Box::pin(app.handle_event(tui, &mut app_server, event))).catch_unwind().await {
+                            Ok(Ok(control)) => control,
+                            Ok(Err(err)) => app.resolve_loop_error(err),
+                            Err(panic) => app.resolve_loop_panic(panic),
                         }
                     }
                     active = async {
@@ -1167,19 +1216,22 @@ See the Codex keymap documentation for supported actions and examples."
                         app.active_thread_rx.is_some()
                     ) => {
                         if let Some(event) = active {
-                            if let Err(err) = app.handle_active_thread_event(tui, &mut app_server, event).await {
-                                break Err(err);
+                            match AssertUnwindSafe(app.handle_active_thread_event(tui, &mut app_server, event)).catch_unwind().await {
+                                Ok(Ok(())) => AppRunControl::Continue,
+                                Ok(Err(err)) => app.resolve_loop_error(err),
+                                Err(panic) => app.resolve_loop_panic(panic),
                             }
                         } else {
                             app.clear_active_thread().await;
+                            AppRunControl::Continue
                         }
-                        AppRunControl::Continue
                     }
                     event = tui_events.next() => {
                         if let Some(event) = event {
-                            match app.handle_tui_event(tui, &mut app_server, event).await {
-                                Ok(control) => control,
-                                Err(err) => break Err(err),
+                            match AssertUnwindSafe(app.handle_tui_event(tui, &mut app_server, event)).catch_unwind().await {
+                                Ok(Ok(control)) => control,
+                                Ok(Err(err)) => app.resolve_loop_error(err),
+                                Err(panic) => app.resolve_loop_panic(panic),
                             }
                         } else {
                             tracing::warn!("terminal input stream closed; shutting down active thread");
@@ -1188,13 +1240,18 @@ See the Codex keymap documentation for supported actions and examples."
                     }
                     app_server_event = app_server.next_event(), if listen_for_app_server_events => {
                         match app_server_event {
-                            Some(event) => app.handle_app_server_event(&app_server, event).await,
+                            Some(event) => {
+                                match AssertUnwindSafe(app.handle_app_server_event(&app_server, event)).catch_unwind().await {
+                                    Ok(_) => AppRunControl::Continue,
+                                    Err(panic) => app.resolve_loop_panic(panic),
+                                }
+                            }
                             None => {
                                 listen_for_app_server_events = false;
                                 tracing::warn!("app-server event stream closed");
+                                AppRunControl::Continue
                             }
                         }
-                        AppRunControl::Continue
                     }
                 };
                 if App::should_stop_waiting_for_initial_session(
@@ -1204,32 +1261,28 @@ See the Codex keymap documentation for supported actions and examples."
                     waiting_for_initial_session_configured = false;
                 }
                 match control {
-                    AppRunControl::Continue => {}
-                    AppRunControl::Exit(reason) => break Ok(reason),
+                    AppRunControl::Continue => {
+                        app.consecutive_loop_errors = 0;
+                    }
+                    AppRunControl::Exit(reason) => break reason,
                 }
             }
         };
+        tracing::info!(exit_reason = ?exit_reason, "tui run loop exited; shutting down app server");
+        // Always drive the embedded app-server shutdown, which submits Op::Shutdown to every
+        // thread and flushes the rollout. This must run on every exit path (including fatal
+        // ones) so the in-flight turn is durably persisted before the process tears down.
         if let Err(err) = app_server.shutdown().await {
             tracing::warn!(error = %err, "failed to shut down embedded app server");
         }
-        let clear_pet_result = tui.clear_ambient_pet_image();
-        let clear_result = tui.terminal.clear();
-        let exit_reason = match exit_reason_result {
-            Ok(exit_reason) => {
-                clear_pet_result?;
-                clear_result?;
-                exit_reason
-            }
-            Err(err) => {
-                if let Err(clear_pet_err) = clear_pet_result {
-                    tracing::warn!(error = %clear_pet_err, "failed to clear ambient pet image");
-                }
-                if let Err(clear_err) = clear_result {
-                    tracing::warn!(error = %clear_err, "failed to clear terminal UI");
-                }
-                return Err(err);
-            }
-        };
+        // Terminal cleanup is best-effort: a failure here must not turn a normal exit into a
+        // fatal error (and the rollout has already been flushed above regardless).
+        if let Err(clear_pet_err) = tui.clear_ambient_pet_image() {
+            tracing::warn!(error = %clear_pet_err, "failed to clear ambient pet image");
+        }
+        if let Err(clear_err) = tui.terminal.clear() {
+            tracing::warn!(error = %clear_err, "failed to clear terminal UI");
+        }
         let thread_id = app.chat_widget.thread_id().or(app.primary_thread_id);
         let resume_hint = resume_hint_for_resumable_thread(
             thread_id,
@@ -1243,6 +1296,57 @@ See the Codex keymap documentation for supported actions and examples."
             update_action: app.pending_update_action,
             exit_reason,
         })
+    }
+
+    /// Decide how the main run loop should react to an error surfaced by one of its iterations.
+    ///
+    /// A recoverable error (e.g. a transient transcript reflow glitch during the heavy redraw an
+    /// interrupt triggers while a long-running task streams output) is logged, surfaced to the
+    /// user, and the loop continues — pressing Esc/Ctrl-C must never tear the whole session down.
+    /// Only a genuinely unusable terminal, or too many consecutive failures, exits, and even then
+    /// via the graceful `ExitReason::Fatal` path so the post-loop app-server shutdown still flushes
+    /// the rollout.
+    fn resolve_loop_error(&mut self, err: color_eyre::eyre::Report) -> AppRunControl {
+        match classify_loop_error(&err) {
+            LoopErrorDisposition::Fatal => {
+                tracing::error!(error = ?err, "fatal TUI loop error; exiting gracefully");
+                AppRunControl::Exit(ExitReason::Fatal(format!("{err:#}")))
+            }
+            LoopErrorDisposition::Recoverable => {
+                self.consecutive_loop_errors = self.consecutive_loop_errors.saturating_add(1);
+                tracing::warn!(
+                    error = ?err,
+                    count = self.consecutive_loop_errors,
+                    "recoverable TUI loop error; continuing",
+                );
+                self.chat_widget
+                    .add_error_message(format!("Recovered from a UI error: {err:#}"));
+                if self.consecutive_loop_errors >= MAX_CONSECUTIVE_LOOP_ERRORS {
+                    tracing::error!(
+                        count = self.consecutive_loop_errors,
+                        "too many consecutive UI errors; exiting gracefully",
+                    );
+                    AppRunControl::Exit(ExitReason::Fatal(
+                        "Too many consecutive UI errors; exiting.".to_string(),
+                    ))
+                } else {
+                    AppRunControl::Continue
+                }
+            }
+        }
+    }
+
+    /// React to a panic caught while handling a main-loop iteration. Exiting through the graceful
+    /// `ExitReason::Fatal` path (rather than letting the panic unwind past the loop) guarantees the
+    /// post-loop app-server shutdown runs and flushes the rollout, so an in-flight turn is not
+    /// silently lost on resume.
+    fn resolve_loop_panic(&mut self, panic: Box<dyn std::any::Any + Send>) -> AppRunControl {
+        let message = panic_payload_message(panic.as_ref());
+        tracing::error!(
+            panic = %message,
+            "panic while handling TUI event; exiting gracefully after flushing session",
+        );
+        AppRunControl::Exit(ExitReason::Fatal(format!("internal error: {message}")))
     }
 
     pub(crate) async fn handle_tui_event(

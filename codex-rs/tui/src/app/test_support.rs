@@ -51,6 +51,7 @@ pub(super) async fn make_test_app() -> App {
         app_server_target: crate::AppServerTarget::Embedded,
         pending_update_action: None,
         pending_shutdown_exit_thread_id: None,
+        consecutive_loop_errors: 0,
         windows_sandbox: WindowsSandboxState::default(),
         thread_event_channels: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
