@@ -1166,3 +1166,134 @@ async fn resume_candidate_matches_cwd_reads_latest_turn_context() -> std::io::Re
     );
     Ok(())
 }
+
+fn in_flight_message_params(thread_id: ThreadId) -> RolloutRecorderParams {
+    RolloutRecorderParams::new(
+        thread_id,
+        /*forked_from_id*/ None,
+        /*parent_thread_id*/ None,
+        SessionSource::Exec,
+        /*thread_source*/ None,
+        BaseInstructions::default(),
+        Vec::new(),
+    )
+}
+
+fn in_flight_message_item() -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        client_id: None,
+        message: "in-flight-message".to_string(),
+        images: None,
+        local_images: Vec::new(),
+        text_elements: Vec::new(),
+        ..Default::default()
+    }))
+}
+
+fn rollout_contains_in_flight_message(items: &[RolloutItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(EventMsg::UserMessage(event))
+                if event.message == "in-flight-message"
+        )
+    })
+}
+
+/// Characterizes the real durability gap behind the TUI message-loss bug: `record_canonical_items`
+/// only enqueues a write for the rollout writer task; nothing has actually reached disk until a
+/// `flush`/`persist`/`shutdown` round trip is awaited. A panic unwinding out of the process (and
+/// therefore dropping the tokio runtime) before that round trip happens is exactly what discards
+/// in-flight turn history, independent of any TUI code. This test reproduces that mechanism
+/// directly against the production `RolloutRecorder`, with no TUI involved.
+#[test]
+fn abrupt_runtime_drop_can_lose_unflushed_rollout_items() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let thread_id = ThreadId::new();
+
+    // A current-thread runtime makes the race deterministic: the writer task spawned inside
+    // `RolloutRecorder::new` is scheduled but never polled before `block_on` returns, because
+    // queuing the item below never yields back to the executor.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+
+    let rollout_path = runtime.block_on(async {
+        let recorder = RolloutRecorder::new(&config, in_flight_message_params(thread_id))
+            .await
+            .expect("create recorder");
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        recorder
+            .record_canonical_items(&[in_flight_message_item()])
+            .await
+            .expect("queue in-flight item");
+        // Deliberately drop the recorder handle here without calling `flush`, `persist`, or
+        // `shutdown` -- mirroring a panic that unwinds straight out of the TUI's main loop.
+        drop(recorder);
+        rollout_path
+    });
+    drop(runtime);
+
+    let verify_runtime = tokio::runtime::Runtime::new().expect("build verify runtime");
+    let contains_message = verify_runtime.block_on(async {
+        if !rollout_path.exists() {
+            return false;
+        }
+        match RolloutRecorder::load_rollout_items(&rollout_path).await {
+            Ok((items, _, _)) => rollout_contains_in_flight_message(&items),
+            Err(_) => false,
+        }
+    });
+
+    assert!(
+        !contains_message,
+        "abrupt teardown unexpectedly preserved the unflushed item; this reproduction no \
+         longer demonstrates the loss it exists to characterize"
+    );
+}
+
+/// The counterpart to `abrupt_runtime_drop_can_lose_unflushed_rollout_items`: awaiting
+/// `shutdown()` before the runtime is torn down forces the writer task to drain and persist
+/// every queued item first. This is the exact guarantee the TUI's panic-safety fix relies on --
+/// always calling `app_server.shutdown()` on every exit path (including a caught panic) is only
+/// a real fix because `shutdown()` makes this round trip durable.
+#[test]
+fn shutdown_before_runtime_drop_preserves_in_flight_rollout_items() {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let thread_id = ThreadId::new();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+
+    let rollout_path = runtime.block_on(async {
+        let recorder = RolloutRecorder::new(&config, in_flight_message_params(thread_id))
+            .await
+            .expect("create recorder");
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        recorder
+            .record_canonical_items(&[in_flight_message_item()])
+            .await
+            .expect("queue in-flight item");
+        recorder
+            .shutdown()
+            .await
+            .expect("shutdown should drain queued items");
+        rollout_path
+    });
+    drop(runtime);
+
+    let verify_runtime = tokio::runtime::Runtime::new().expect("build verify runtime");
+    let (items, _, _) = verify_runtime
+        .block_on(RolloutRecorder::load_rollout_items(&rollout_path))
+        .expect("rollout should be readable after shutdown");
+
+    assert!(
+        rollout_contains_in_flight_message(&items),
+        "shutdown() should have persisted the queued item before the runtime was dropped"
+    );
+}
