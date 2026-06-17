@@ -1199,11 +1199,11 @@ See the Codex keymap documentation for supported actions and examples."
             loop {
                 let control = select! {
                     Some(event) = app_event_rx.recv() => {
-                        match AssertUnwindSafe(Box::pin(app.handle_event(tui, &mut app_server, event))).catch_unwind().await {
-                            Ok(Ok(control)) => control,
-                            Ok(Err(err)) => app.resolve_loop_error(err),
-                            Err(panic) => app.resolve_loop_panic(panic),
-                        }
+                        let outcome = Self::run_loop_body_guarded(
+                            Box::pin(app.handle_event(tui, &mut app_server, event)),
+                        )
+                        .await;
+                        app.resolve_loop_outcome(outcome)
                     }
                     active = async {
                         if let Some(rx) = app.active_thread_rx.as_mut() {
@@ -1216,11 +1216,11 @@ See the Codex keymap documentation for supported actions and examples."
                         app.active_thread_rx.is_some()
                     ) => {
                         if let Some(event) = active {
-                            match AssertUnwindSafe(app.handle_active_thread_event(tui, &mut app_server, event)).catch_unwind().await {
-                                Ok(Ok(())) => AppRunControl::Continue,
-                                Ok(Err(err)) => app.resolve_loop_error(err),
-                                Err(panic) => app.resolve_loop_panic(panic),
-                            }
+                            let outcome = Self::run_loop_body_guarded(
+                                app.handle_active_thread_event(tui, &mut app_server, event),
+                            )
+                            .await;
+                            app.resolve_loop_outcome_unit(outcome)
                         } else {
                             app.clear_active_thread().await;
                             AppRunControl::Continue
@@ -1228,11 +1228,11 @@ See the Codex keymap documentation for supported actions and examples."
                     }
                     event = tui_events.next() => {
                         if let Some(event) = event {
-                            match AssertUnwindSafe(app.handle_tui_event(tui, &mut app_server, event)).catch_unwind().await {
-                                Ok(Ok(control)) => control,
-                                Ok(Err(err)) => app.resolve_loop_error(err),
-                                Err(panic) => app.resolve_loop_panic(panic),
-                            }
+                            let outcome = Self::run_loop_body_guarded(
+                                app.handle_tui_event(tui, &mut app_server, event),
+                            )
+                            .await;
+                            app.resolve_loop_outcome(outcome)
                         } else {
                             tracing::warn!("terminal input stream closed; shutting down active thread");
                             app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await
@@ -1241,10 +1241,11 @@ See the Codex keymap documentation for supported actions and examples."
                     app_server_event = app_server.next_event(), if listen_for_app_server_events => {
                         match app_server_event {
                             Some(event) => {
-                                match AssertUnwindSafe(app.handle_app_server_event(&app_server, event)).catch_unwind().await {
-                                    Ok(_) => AppRunControl::Continue,
-                                    Err(panic) => app.resolve_loop_panic(panic),
-                                }
+                                let outcome = Self::run_loop_body_guarded(
+                                    app.handle_app_server_event(&app_server, event),
+                                )
+                                .await;
+                                app.resolve_loop_outcome_infallible(outcome)
                             }
                             None => {
                                 listen_for_app_server_events = false;
@@ -1268,13 +1269,10 @@ See the Codex keymap documentation for supported actions and examples."
                 }
             }
         };
-        tracing::info!(exit_reason = ?exit_reason, "tui run loop exited; shutting down app server");
         // Always drive the embedded app-server shutdown, which submits Op::Shutdown to every
         // thread and flushes the rollout. This must run on every exit path (including fatal
         // ones) so the in-flight turn is durably persisted before the process tears down.
-        if let Err(err) = app_server.shutdown().await {
-            tracing::warn!(error = %err, "failed to shut down embedded app server");
-        }
+        Self::shutdown_app_server_after_run(app_server, &exit_reason).await;
         // Terminal cleanup is best-effort: a failure here must not turn a normal exit into a
         // fatal error (and the rollout has already been flushed above regardless).
         if let Err(clear_pet_err) = tui.clear_ambient_pet_image() {
@@ -1347,6 +1345,67 @@ See the Codex keymap documentation for supported actions and examples."
             "panic while handling TUI event; exiting gracefully after flushing session",
         );
         AppRunControl::Exit(ExitReason::Fatal(format!("internal error: {message}")))
+    }
+
+    /// Drive a single main-loop body future under `catch_unwind` so that a panic raised inside an
+    /// event handler is captured here instead of unwinding past the post-loop teardown that flushes
+    /// the rollout. Returning the raw [`std::thread::Result`] (rather than resolving inline) keeps
+    /// this seam free of any `&mut self` borrow, so the production loop and the unit tests exercise
+    /// the exact same panic boundary.
+    async fn run_loop_body_guarded<F>(fut: F) -> std::thread::Result<F::Output>
+    where
+        F: std::future::Future,
+    {
+        AssertUnwindSafe(fut).catch_unwind().await
+    }
+
+    /// Resolve the outcome of a loop body that yields an explicit [`AppRunControl`]
+    /// (`handle_event` / `handle_tui_event`).
+    fn resolve_loop_outcome(
+        &mut self,
+        outcome: std::thread::Result<Result<AppRunControl>>,
+    ) -> AppRunControl {
+        match outcome {
+            Ok(Ok(control)) => control,
+            Ok(Err(err)) => self.resolve_loop_error(err),
+            Err(panic) => self.resolve_loop_panic(panic),
+        }
+    }
+
+    /// Resolve the outcome of a loop body that yields `Result<()>` and continues on success
+    /// (`handle_active_thread_event`).
+    fn resolve_loop_outcome_unit(
+        &mut self,
+        outcome: std::thread::Result<Result<()>>,
+    ) -> AppRunControl {
+        match outcome {
+            Ok(Ok(())) => AppRunControl::Continue,
+            Ok(Err(err)) => self.resolve_loop_error(err),
+            Err(panic) => self.resolve_loop_panic(panic),
+        }
+    }
+
+    /// Resolve the outcome of an infallible loop body that continues on success
+    /// (`handle_app_server_event`).
+    fn resolve_loop_outcome_infallible(
+        &mut self,
+        outcome: std::thread::Result<()>,
+    ) -> AppRunControl {
+        match outcome {
+            Ok(()) => AppRunControl::Continue,
+            Err(panic) => self.resolve_loop_panic(panic),
+        }
+    }
+
+    /// Drive the embedded app-server shutdown that runs at the end of [`App::run`]. Shutdown submits
+    /// `Op::Shutdown` to every thread and flushes the rollout, so it must run on every exit path —
+    /// including a fatal exit produced by a caught panic — to durably persist the in-flight turn
+    /// before the process tears down.
+    async fn shutdown_app_server_after_run(app_server: AppServerSession, exit_reason: &ExitReason) {
+        tracing::info!(exit_reason = ?exit_reason, "tui run loop exited; shutting down app server");
+        if let Err(err) = app_server.shutdown().await {
+            tracing::warn!(error = %err, "failed to shut down embedded app server");
+        }
     }
 
     pub(crate) async fn handle_tui_event(

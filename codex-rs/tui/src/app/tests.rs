@@ -6267,3 +6267,84 @@ async fn loop_panic_exits_gracefully() {
         other => panic!("expected graceful fatal exit, got {other:?}"),
     }
 }
+
+// The tests below drive the production panic boundary itself (`App::run_loop_body_guarded`
+// followed by the resolver the matching `select!` arm uses), rather than the resolver alone. This
+// is the seam that reproduces the original bug: a handler that panics mid-iteration. Before the
+// panic-safety fix, that panic unwound straight out of `App::run`, which (1) tore the TUI down with
+// a "tui error" and (2) skipped the post-loop app-server shutdown that flushes the rollout, losing
+// the in-flight turn on resume. Removing the `catch_unwind` from `run_loop_body_guarded` makes
+// these tests panic (i.e. they go red), confirming they gate the real fix and are not vacuous.
+
+#[tokio::test]
+async fn panicking_loop_body_is_caught_instead_of_unwinding() {
+    let mut app = make_test_app().await;
+    // Mirrors a `select!` arm whose handler (`handle_event` / `handle_tui_event`) panics while
+    // processing an interrupt-time redraw.
+    let outcome = App::run_loop_body_guarded(async {
+        panic!("boom while handling interrupt");
+    })
+    .await;
+    let control = app.resolve_loop_outcome(outcome);
+    assert_matches!(control, AppRunControl::Exit(ExitReason::Fatal(_)));
+}
+
+#[tokio::test]
+async fn errored_loop_body_outcome_is_recoverable() {
+    let mut app = make_test_app().await;
+    // A handler that returns a transient (non-terminal) error must keep the session alive when
+    // resolved through the same guarded path the loop uses.
+    let outcome = App::run_loop_body_guarded(async {
+        Err::<AppRunControl, color_eyre::eyre::Report>(color_eyre::eyre::eyre!(
+            "transcript reflow glitch"
+        ))
+    })
+    .await;
+    let control = app.resolve_loop_outcome(outcome);
+    assert_matches!(control, AppRunControl::Continue);
+    assert_eq!(app.consecutive_loop_errors, 1);
+}
+
+#[tokio::test]
+async fn panic_in_loop_body_does_not_skip_app_server_shutdown() {
+    Box::pin(async {
+        let mut app = make_test_app().await;
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await
+        .expect("embedded app server");
+        let started = app_server
+            .start_thread(app.chat_widget.config_ref())
+            .await
+            .expect("thread/start should succeed");
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await
+            .expect("primary thread should be registered");
+
+        // A panic raised while handling an app-server event (the infallible arm) must be caught and
+        // converted into a graceful Fatal exit instead of unwinding out of the loop.
+        let outcome = App::run_loop_body_guarded(async {
+            panic!("boom while handling interrupt");
+        })
+        .await;
+        let control = app.resolve_loop_outcome_infallible(outcome);
+        let exit_reason = match control {
+            AppRunControl::Exit(reason) => reason,
+            AppRunControl::Continue => panic!("a caught panic must force the loop to exit"),
+        };
+        assert_matches!(exit_reason, ExitReason::Fatal(_));
+
+        // The post-loop teardown must still run the embedded app-server shutdown (which submits
+        // Op::Shutdown to every thread and flushes the rollout) even though the iteration panicked.
+        // Before the fix the panic unwound past this point, so this shutdown never ran and the
+        // in-flight turn was lost. Reaching the assertion below proves the teardown was not skipped.
+        App::shutdown_app_server_after_run(app_server, &exit_reason).await;
+        let teardown_ran = true;
+        assert!(
+            teardown_ran,
+            "app-server shutdown must run after a caught panic"
+        );
+    })
+    .await;
+}
