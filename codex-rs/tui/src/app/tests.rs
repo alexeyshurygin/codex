@@ -5641,7 +5641,26 @@ fn active_turn_interrupt_race_extracts_actual_turn_id_from_mismatch() {
 
     assert_eq!(
         active_turn_interrupt_race(&error),
-        Some("turn-actual".to_string())
+        Some(ActiveTurnInterruptRace::ExpectedTurnMismatch {
+            actual_turn_id: "turn-actual".to_string(),
+        })
+    );
+}
+
+#[test]
+fn active_turn_interrupt_race_detects_missing_active_turn() {
+    let error = TypedRequestError::Server {
+        method: "turn/interrupt".to_string(),
+        source: JSONRPCErrorError {
+            code: -32600,
+            message: "no active turn to interrupt".to_string(),
+            data: None,
+        },
+    };
+
+    assert_eq!(
+        active_turn_interrupt_race(&error),
+        Some(ActiveTurnInterruptRace::Missing)
     );
 }
 
@@ -6890,6 +6909,90 @@ async fn interrupt_without_active_turn_is_treated_as_handled() {
         .expect("interrupt submission should not fail");
 
         assert_eq!(handled, true);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn esc_interrupt_with_stale_active_turn_is_treated_as_handled() {
+    Box::pin(async {
+        let mut app = make_test_app().await;
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await
+        .expect("embedded app server");
+        let started = app_server
+            .start_thread(app.chat_widget.config_ref())
+            .await
+            .expect("thread/start should succeed");
+        let thread_id = started.session.thread_id;
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await
+            .expect("primary thread should be registered");
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let mut store = channel.store.lock().await;
+            store.active_turn_id = Some("stale-turn".to_string());
+        }
+
+        let op = AppCommand::interrupt();
+        let handled = Box::pin(app.try_submit_active_thread_op_via_app_server(
+            &mut app_server,
+            thread_id,
+            &op,
+        ))
+        .await
+        .expect("stale interrupt should not fail the TUI");
+
+        assert_eq!(handled, true);
+        assert_eq!(app.active_turn_id_for_thread(thread_id).await, None);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn ctrl_c_interrupt_with_stale_active_turn_is_treated_as_handled() {
+    Box::pin(async {
+        let mut app = make_test_app().await;
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await
+        .expect("embedded app server");
+        let started = app_server
+            .start_thread(app.chat_widget.config_ref())
+            .await
+            .expect("thread/start should succeed");
+        let thread_id = started.session.thread_id;
+        app.enqueue_primary_thread_session(started.session, started.turns)
+            .await
+            .expect("primary thread should be registered");
+
+        {
+            let channel = app
+                .thread_event_channels
+                .get(&thread_id)
+                .expect("thread channel should exist");
+            let mut store = channel.store.lock().await;
+            store.active_turn_id = Some("stale-turn".to_string());
+        }
+
+        let op = AppCommand::interrupt();
+        let handled = Box::pin(app.try_submit_active_thread_op_via_app_server(
+            &mut app_server,
+            thread_id,
+            &op,
+        ))
+        .await
+        .expect("stale ctrl-c interrupt should not fail the TUI");
+
+        assert_eq!(handled, true);
+        assert_eq!(app.active_turn_id_for_thread(thread_id).await, None);
     })
     .await;
 }
