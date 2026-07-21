@@ -660,6 +660,12 @@ enum ActiveTurnSteerRace {
     ExpectedTurnMismatch { actual_turn_id: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActiveTurnInterruptRace {
+    Missing,
+    ExpectedTurnMismatch { actual_turn_id: String },
+}
+
 fn active_turn_steer_race(error: &TypedRequestError) -> Option<ActiveTurnSteerRace> {
     let TypedRequestError::Server { method, source } = error else {
         return None;
@@ -710,23 +716,26 @@ fn archived_session_guidance(err: &color_eyre::eyre::Report) -> Option<String> {
     Some(message.to_string())
 }
 
-fn active_turn_interrupt_race(error: &TypedRequestError) -> Option<String> {
+fn active_turn_interrupt_race(error: &TypedRequestError) -> Option<ActiveTurnInterruptRace> {
     let TypedRequestError::Server { method, source } = error else {
         return None;
     };
     if method != "turn/interrupt" {
         return None;
     }
+    if source.message == "no active turn to interrupt" {
+        return Some(ActiveTurnInterruptRace::Missing);
+    }
+
     let mismatch_prefix = "expected active turn id ";
     let mismatch_separator = " but found ";
-    Some(
-        source
-            .message
-            .strip_prefix(mismatch_prefix)?
-            .split_once(mismatch_separator)?
-            .1
-            .to_string(),
-    )
+    let actual_turn_id = source
+        .message
+        .strip_prefix(mismatch_prefix)?
+        .split_once(mismatch_separator)?
+        .1
+        .to_string();
+    Some(ActiveTurnInterruptRace::ExpectedTurnMismatch { actual_turn_id })
 }
 
 impl App {
